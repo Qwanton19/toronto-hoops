@@ -1,0 +1,16 @@
+requests
+geopandas
+pyogrio
+shapely
+pyproj
+pillow
+numpy
+pandas
+tqdm
+open_clip_torch
+# torch: install a CUDA build first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch
+pyarrow
+scikit-learn
+matplotlib  # only needed for generate_report_assets.py

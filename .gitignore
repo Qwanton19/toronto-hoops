@@ -1,0 +1,25 @@
+# Environment
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# Large regenerable caches (re-run detect.py / train_probe.py / count.py to rebuild)
+data/windows/
+data/candidates.npz
+data/train_cache.npz
+data/best_per_lot.parquet
+data/best_per_lot.stamp
+data/labels_emb.pkl
+data/osm_neg_cache.npz
+data/osm_neg_pool.npz
+
+# Raw source downloads (re-run fetch_parcels.py to rebuild)
+data/property-boundaries-4326.gpkg
+data/residential.parquet
+
+# Scratch output from review.py / count.py (regenerated each run)
+data/review.jpg
+data/review_order.csv
+data/zoom.jpg
+data/results.csv
