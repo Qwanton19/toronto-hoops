@@ -1,16 +1,8 @@
 # toronto-hoops
 
-Finding every backyard basketball court in a major city from aerial imagery alone — no building
-footprints, no address data, nothing but a public orthophoto feed, open parcel boundaries, and a
-vision-language model pushed into a role it wasn't built for.
-
-The pipeline scans the City of Toronto's full residential parcel inventory, turns each lot into a
-small set of GPU-batched CLIP embeddings, and scores them with a classifier that started from
-nothing but OpenStreetMap tags and was refined over successive rounds of active learning into a
-model that reliably tells a basketball court apart from a pool, a tennis court, a parking lot, or
-a sun-faded patch of driveway.
-
-**Result: 276 confirmed backyard basketball courts found and verified across the entire city.**
+Ever wonder how many Torontonians have a private basketball court in their backyard? Probably
+not — but in case you did, there are at least **276 confirmed backyard basketball courts** across
+the entire city.
 
 <p align="center">
   <img src="docs/images/sample_courts_grid.jpg" width="640" alt="Grid of detected backyard basketball courts, each cropped from aerial orthophoto imagery">
@@ -21,21 +13,24 @@ a sun-faded patch of driveway.
   <img src="docs/images/court_distribution_map.png" width="520" alt="Scatter map of all 276 confirmed court locations across Toronto">
 </p>
 
-## Why this is a harder problem than it sounds
+This started as a project to learn how to train vision models on real-world aerial imagery, in an
+attempt to track down the city's hidden home courts — with nothing to go on but a public orthophoto
+feed and an open parcel-boundary dataset.
 
-There is no "basketball court" layer in any public dataset for Toronto. The only ingredients
-available are:
-- an **ArcGIS tile/export service** serving the city's orthophoto imagery (~11 cm/pixel on the
-  ground), with no capture date and no object metadata at all;
-- a **parcel-boundary dataset** with a parcel ID and a stated area, nothing else — no address, no
-  land-use code, no building footprint;
-- **OpenStreetMap**, which has a sparse, noisy `sport=basketball` tag, mostly on public courts, and
-  essentially never on the private backyard courts this project cares about.
+## Pipeline
 
-So every signal — what counts as a house lot, where on that lot to look, and what a court actually
-looks like from directly overhead — had to be built from scratch rather than looked up.
+1. **Parcel sourcing** — pull Toronto's open parcel data, filter down to house-sized residential lots.
+2. **Imagery + embeddings** — tile the city's aerial orthophoto feed, GPU-batch every lot through CLIP.
+3. **Bootstrap classifier** — train an MLP ensemble on OpenStreetMap courts/pools/tennis courts as weak labels.
+4. **Active learning** — score every lot, review the top candidates, relabel, retrain, repeat.
+5. **Dedupe + export** — merge same-court duplicates, ship CSV/GeoJSON with map links.
 
-## Approach
+*Amendment: step 3 wasn't the starting point — it's what step 3 became. The very first pass skipped
+training entirely and just prompted CLIP directly ("an aerial photo of a basketball court" vs. a
+pool, a driveway, a lawn) — a pure zero-shot, vision-language approach with no labeled data at all.
+It found real courts, but it also ranked sun-bleached driveways and flat rooftops above courts
+sitting in tree shade. That gap is exactly what pushed this into training an actual classifier and
+running it through active learning instead of trusting a frozen prompt.*
 
 ```mermaid
 flowchart LR
@@ -50,104 +45,125 @@ flowchart LR
     H -- converged --> I[Dedupe + export\ncourts.csv / .geojson]
 ```
 
-### 1. Parcel sourcing and filtering
-Toronto's Property Boundaries open dataset has no land-use field, so "residential" is approximated
-by keeping ordinary (`FEATURE_TYPE == COMMON`) parcels between 150–1,500 m², then dropping slivers
-and oddly-shaped lots with a compactness check (`area / minimum-rotated-rectangle area ≥ 0.6`) and a
-minimum-width check (`≥ 7 m`). That brings 498k raw parcel polygons down to **428,348** house-sized
-lots across the city.
+## How it works, step by step
 
-### 2. Imagery pipeline
-Rather than downloading and storing full-resolution imagery per lot, the pipeline tiles the city
-into 300 m blocks (9,777 of them), downloads each once from the city's export endpoint, and reuses
-it for every lot inside that tile. A grid of candidate window centres (128 px / ~14 m square, on an
-~8.6 m stride) is laid over each lot's polygon, and every window is extracted and embedded **on the
-GPU in a single batched call per tile** using `torchvision.ops.roi_align` directly against the
-tile's tensor — avoiding a Python-level crop-and-resize per window, which is what made scanning
-hundreds of thousands of lots computationally tractable on a single consumer GPU.
+Each section below explains the step in plain terms, calls out the parts that were genuinely hard
+to get right, and gives the exact command that runs it.
 
-### 3. From zero-shot prompts to a trained classifier
-The first pass used plain CLIP zero-shot scoring against text prompts ("an aerial photo of a
-basketball court" vs. pools, patios, driveways, lawns). It worked well enough to *find* a handful of
-real courts, but precision near the top of the ranking was poor — courts under tree cover scored
-far lower than driveways, flat roofs, and sun-bleached concrete. That motivated moving to a trained
-classifier: a small MLP ensemble (5 independently-seeded two-layer networks, 512 → 256 → 1,
-class-balanced and sample-weighted) on top of frozen CLIP embeddings, with scores averaged across
-the ensemble.
+### 1. Parcel sourcing
 
-### 4. Bootstrapping with OpenStreetMap, before any manual labels existed
-Before a single image had been hand-reviewed, the classifier already had a sense of what a court
-looked like and what it didn't:
-- **Positives** — OpenStreetMap's `sport=basketball` points and ways, plus the small subset of
-  those that happen to sit inside a residential parcel (upweighted, since those are the closest
-  analog to the private courts being searched for).
-- **Hard negatives** — OpenStreetMap tennis courts and swimming pools (the two most visually similar
-  features from directly above), parking lots, playgrounds, and large flat-roofed buildings, plus
-  thousands of random windows sampled from ordinary residential lots.
+- There's no "basketball court" layer in any public Toronto dataset, so step one is just figuring
+  out *where houses even are*. A **parcel** is simply a legal property boundary — a polygon on a
+  map, nothing more.
+- Toronto's open Property Boundaries dataset gives a parcel ID and a stated area, but no address, no
+  land-use code, and no building footprint — it doesn't even say "this is a house" vs. "this is a
+  school." So "residential" is approximated: keep ordinary parcels (`FEATURE_TYPE == COMMON`)
+  between 150–1,500 m², roughly the size range of a detached house lot.
+- Odd-shaped slivers (narrow lanes, leftover strips of land) get filtered out with two simple
+  geometry checks: a **compactness** ratio (how much of the lot's own bounding rectangle it
+  actually fills) and a minimum width, so the pipeline doesn't waste time scanning a 2-metre-wide
+  strip of grass.
+- That brings ~498,000 raw parcel polygons down to **428,348** house-sized lots.
+- **Hard part:** nothing in the data says "residential" directly — every filter here is a guess
+  backed only by lot size and shape, so a few non-houses inevitably slip through and a few real
+  houses on odd-shaped lots get dropped.
+- **Scope:** this only covers the City of Toronto proper. The city's imagery service doesn't extend
+  into Mississauga, Brampton, Markham, or the rest of the GTA, so courts outside Toronto's own
+  boundary simply aren't in this dataset.
+- **Run it:** `python fetch_parcels.py`
 
-### 5. Active learning: review, label, retrain, repeat
-With a classifier in hand, every lot in the city was scored, and the review loop began:
-- a grid of the highest-scoring (or a random sample within a chosen score band) candidates was
-  rendered as a labeled image grid;
-- each tile was judged — a true court, a lookalike (pool, roof, pad, shadow), or left unlabeled when
-  genuinely ambiguous;
-- the labels were folded back into training (confirmed courts upweighted 4×, confirmed rejections
-  2×) and the ensemble was retrained;
-- every lot was rescored and the next round of review started from whatever the new model ranked
-  highest among lots it hadn't already seen.
+### 2. Imagery + embeddings
 
-This is the part that actually drove the result: the first rounds were dominated by false positives
-(flat rooftops, parking-lot markings, sun-faded driveway concrete), and each retraining pass pushed
-those out of the top of the ranking while pulling genuinely hard cases — courts partly hidden by
-trees, courts sharing a frame with a pool — further up. The hand-labeled set grew from a 53-example
-calibration pass to **1,524 reviewed window labels** (287 confirmed courts, 1,237 confirmed
-non-courts) by the final round, and each round's classifier was checked against a held-out 20% of
-the labeled set it hadn't trained on.
+- Keyword: **orthophoto** — an aerial photo that's been corrected to line up accurately with a map
+  (straight down, no perspective distortion), unlike a regular angled photo. Toronto publishes one
+  through a public ArcGIS tile/export service.
+- Downloading a separate image per lot would mean 428,348 downloads. Instead, the city gets sliced
+  into ~300-metre tiles (9,777 of them), each tile downloaded once and reused for every lot inside
+  it.
+- Keyword: **CLIP** (Contrastive Language–Image Pretraining) — a neural network that turns any image
+  into a list of numbers (an **embedding**) such that visually and semantically similar images end
+  up with similar numbers. It's normally used to match images to text captions; here it's
+  repurposed as a general-purpose "what does this look like" feature extractor.
+- A grid of candidate 128-pixel (~14 m) windows is laid over each lot, and every window on a tile is
+  cropped and embedded **in a single GPU call** using `torchvision`'s `roi_align` — pulling crops
+  directly out of the tile's image tensor on the GPU, rather than cropping and resizing each window
+  one at a time in Python.
+- **Hard part:** the first version did exactly that — a Python crop-and-resize per window — and it
+  was far too slow to ever finish scanning the whole city. Batching every window on a tile into one
+  GPU operation is what turned a full-city scan from a multi-day job into a multi-hour one.
+- **Limitation:** the imagery service doesn't publish a capture date anywhere, so every result here
+  reflects whenever that imagery happened to be flown, not necessarily today.
+- **Run it:** `python detect.py [--bbox LON_MIN LAT_MIN LON_MAX LAT_MAX] [--max-blocks N]`
+  (resumable; `--bbox` lets you try one neighbourhood first; embeddings get cached in
+  `data/windows/`).
 
-<p align="center">
-  <img src="docs/images/labeling_progress.png" width="560" alt="Chart showing the hand-labeled training set growing from 53 to 1,524 examples across review rounds">
-</p>
+### 3. Bootstrap classifier
 
-Held-out average precision on labeled windows stayed in the **0.95–0.98** range through every
-retraining round once the ensemble and hard-negative mining were in place — meaning the ranking
-stayed trustworthy even as the labeled set kept growing and the model kept being re-fit from
-scratch each round.
+- Keyword: **weak labels** — labels that are easy to get automatically but aren't perfectly
+  accurate, used to get a model started before any manual work happens.
+- OpenStreetMap tags a sparse set of public basketball courts (`sport=basketball`), tennis courts,
+  and swimming pools. None of that is really "private backyard courts," but it's a free, if noisy,
+  starting point: courts become positive examples, while tennis courts and pools become **hard
+  negatives** — the two things that look most like a court from directly above, and the most likely
+  to be mistaken for one.
+- The classifier itself is an **ensemble** of 5 small two-layer neural networks (512 → 256 → 1
+  neurons) trained on top of the frozen CLIP embeddings — not fine-tuning CLIP itself, just teaching
+  a much smaller, faster model to read CLIP's embeddings. Averaging 5 independently-trained networks
+  smooths out the quirks any single one would have.
+- **Hard part (the pivot):** as the amendment above mentions, the very first version of this project
+  skipped training altogether and just asked CLIP directly whether an image looked like "a
+  basketball court." That zero-shot approach is the reason this step exists at all — it wasn't
+  accurate enough on its own, so a trained classifier replaced it.
+- **Run it:** `python train_probe.py [--holdout]` — the first run builds and caches the OpenStreetMap
+  training set; every later run retrains on top of whatever's in `data/labels.csv` from the next
+  step.
 
-### 6. Deduplication and export
-A single physical court often spans two neighbouring lots (each sees a different slice of it), so
-detections within 40 m of a higher-scoring one are merged, keeping only the best-scoring lot per
-court. The final list is exported as both CSV and GeoJSON, with a ready-to-click Google Maps
-satellite link for every court.
+### 4. Active learning
 
-## Reproducing it
+- Keyword: **active learning** — instead of labeling a huge dataset by hand up front and training
+  once, the model scores everything first, a human only reviews the cases it's least sure about (or
+  most likely wrong on), and the model gets retrained on those corrections. Repeat.
+- In practice: render the highest-scoring (or a random sample from a chosen score range) lots as a
+  labeled grid of images, look at each one, mark the real courts, retrain, and rescore the whole
+  city. Then repeat with the model's new ranking.
+- Confirmed courts get **upweighted** (4×) during training and confirmed rejections upweighted (2×),
+  so the model pays more attention to its own recent mistakes than to the bulk of easy negatives.
+- **Hard part:** early rounds were dominated by false positives that *look* flat and open from
+  directly overhead — parking-lot line markings, sun-bleached driveway concrete, flat rooftops —
+  exactly the kind of thing the original zero-shot prompt also struggled with. Each retraining round
+  pushed those down the ranking while pulling up genuinely hard true positives: courts half-hidden
+  by trees, courts sharing a frame with a pool.
+- The hand-labeled set grew from a 53-example calibration pass to **1,524 reviewed window labels**
+  (287 confirmed courts, 1,237 confirmed non-courts) by the final round, with each round's model
+  checked against a held-out 20% slice of labels it hadn't trained on — **average precision stayed
+  in the 0.95–0.98 range** throughout, so the ranking stayed trustworthy even as the labeled set kept
+  growing and the model kept being re-fit from scratch.
+- **Limitation:** this is also where the 276-court number comes from, and why it's a floor, not a
+  ceiling. A hoop on a driveway, a portable hoop, or a court fully hidden under tree canopy is
+  invisible from directly overhead no matter how good the classifier gets, and lots scoring below
+  roughly 0.7 were only spot-checked rather than exhaustively reviewed.
+- **Run it:**
+  - `python review.py --unseen --band 0.9 1.01 --top 64` — a grid of the highest-scoring,
+    not-yet-reviewed lots (`data/review.jpg`)
+  - `python review.py --zoom 3,7,9` — a closer look at specific tiles from that grid
+  - `python label.py --courts 1,2,5 --skip 8` — records which ranks were real courts
+  - retrain with `train_probe.py`, pick a new `--band`, and repeat until a page comes back with
+    nothing new
 
-```
-python -m venv .venv
-.venv\Scripts\pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-.venv\Scripts\pip install -r requirements.txt
-```
+### 5. Dedupe + export
 
-1. **`python fetch_parcels.py`** — downloads Toronto's property-boundary dataset and filters it down
-   to house-sized lots.
-2. **`python detect.py [--bbox LON_MIN LAT_MIN LON_MAX LAT_MAX] [--max-blocks N]`** — tiles the
-   imagery, embeds every lot's candidate windows on the GPU, and caches them in `data/windows/`.
-   Fully resumable; a `--bbox` lets you try it on one neighbourhood first.
-3. **`python train_probe.py [--holdout]`** — builds the OpenStreetMap-bootstrapped training set (cached
-   after the first run) and trains the MLP ensemble, folding in anything in `data/labels.csv`.
-4. **Review loop:**
-   - `python review.py --unseen --band 0.9 1.01 --top 64` — a labeled image grid of the
-     highest-scoring, not-yet-reviewed lots (`data/review.jpg`).
-   - `python review.py --zoom 3,7,9` — a closer look at specific tiles from the last grid.
-   - `python label.py --courts 1,2,5 --skip 8` — records which ranks were real courts (anything not
-     listed becomes a confirmed negative, unless `--skip`ped as ambiguous).
-   - Retrain (`train_probe.py`) and repeat with a new `--band` until a page comes back with nothing
-     new.
-5. **`python count.py --confirmed`** — writes the final `data/courts.csv` / `data/courts.geojson`
-   from everything confirmed during review (or `python count.py --threshold 0.9` to export directly
-   from scores, without the manual pass).
-6. **`python montage_courts.py`** — renders the full confirmed list as labeled image grids in
-   `data/court_grids/`, for a final visual sanity pass.
-7. **`python generate_report_assets.py`** — regenerates the two charts used above.
+- A single physical court often sits right on the line between two lots, so the same court can show
+  up twice — once from each neighbour's window grid.
+- Keyword: **deduplication** — any detection within 40 metres of a higher-scoring one gets merged,
+  keeping only the best-scoring lot per physical court.
+- The final list ships as both **CSV** and **GeoJSON** (a standard geographic data format most
+  mapping tools can open directly), with every row carrying a ready-to-click Google Maps satellite
+  link.
+- Two small finishing scripts round this out: `montage_courts.py` renders the confirmed list back
+  out as labeled image grids for a final visual sanity check, and `generate_report_assets.py` builds
+  the charts used above.
+- **Run it:** `python count.py --confirmed` (or `python count.py --threshold 0.9` to export straight
+  from scores, skipping the manual review pass).
 
 ## Project structure
 
@@ -168,16 +184,6 @@ python -m venv .venv
 
 `data/windows/`, `data/candidates.npz`, and the other large caches listed in `.gitignore` aren't
 tracked in this repo (gigabytes of regenerable embeddings) — re-running `detect.py` rebuilds them.
-
-## Limitations
-
-- **Visible courts only.** A hoop on a driveway, a portable hoop, or a court fully hidden by tree
-  canopy is invisible from directly overhead, so the true count is higher than 276.
-  Courts scoring below roughly 0.7 were only spot-checked, not exhaustively reviewed.
-- **Imagery date is unpublished.** The orthophoto service doesn't expose a capture year, so this is
-  a snapshot of whenever that imagery was flown, not necessarily today.
-- **Scope.** Coverage is the City of Toronto only — the orthophoto service's extent doesn't reach
-  Mississauga, Brampton, Markham, or the rest of the wider GTA.
 
 ## Data sources & license
 
